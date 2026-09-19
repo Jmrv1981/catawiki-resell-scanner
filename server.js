@@ -8,7 +8,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8787;
 const BASE = "https://www.catawiki.com/nl";
-const UA = "Mozilla/5.0 (Android 14; Mobile) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36";
+const UA = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36";
 
 const CATEGORY_NAMES = [
   "Archeologie en natuurlijke historie",
@@ -42,7 +42,13 @@ function todayNL() {
 
 async function getHtml(url) {
   const res = await fetch(url, {
-    headers: { "User-Agent": UA, "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8" }
+    headers: {
+      "User-Agent": UA,
+      "Accept": "text/html,application/xhtml+xml",
+      "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+      "Cache-Control": "no-cache"
+    },
+    redirect: "follow"
   });
   if (!res.ok) throw new Error(`Catawiki HTTP ${res.status}`);
   return await res.text();
@@ -50,11 +56,23 @@ async function getHtml(url) {
 
 function euroNumber(text) {
   if (!text) return null;
-  const m = String(text).replace(/\u00a0/g, " ").match(/€\s*([\d.]+(?:,\d{1,2})?)/);
+  const clean = String(text).replace(/\u00a0/g, " ");
+  const m = clean.match(/€\s*([\d.]+(?:,\d{1,2})?)/);
   if (!m) return null;
   const n = m[1].replace(/\./g, "").replace(",", ".");
   const v = Number(n);
   return Number.isFinite(v) ? v : null;
+}
+
+function firstEuro(text, patterns) {
+  for (const pattern of patterns) {
+    const m = String(text || "").match(pattern);
+    if (m) {
+      const v = euroNumber(m[0]);
+      if (v != null) return v;
+    }
+  }
+  return null;
 }
 
 function buyerProtection(bid) {
@@ -66,11 +84,22 @@ function absoluteUrl(href) {
   try { return new URL(href, BASE).toString(); } catch { return null; }
 }
 
-function categorySlugName(url) {
+function normalizeName(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function looksLikeLotUrl(href) {
   try {
-    const p = new URL(url).pathname;
-    return p.split("/").filter(Boolean).pop() || "";
-  } catch { return ""; }
+    const p = new URL(href).pathname;
+    return /\/l\/\d+[-/]/i.test(p) || /\/l\/\d+$/i.test(p);
+  } catch {
+    return false;
+  }
 }
 
 async function discoverCategories() {
@@ -79,18 +108,30 @@ async function discoverCategories() {
   const found = [];
 
   $("a[href]").each((_, a) => {
-    const name = $(a).text().replace(/\s+/g, " ").trim();
     const href = absoluteUrl($(a).attr("href"));
-    if (!href || !href.includes("/nl/c/")) return;
-    const match = CATEGORY_NAMES.find(n => name.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(name.toLowerCase()));
-    if (match && !found.some(x => x.name === match)) found.push({ name: match, url: href });
+    if (!href || !/\/c\/\d+-/i.test(new URL(href).pathname)) return;
+
+    const name = $(a).text().replace(/\s+/g, " ").trim();
+    const n = normalizeName(name);
+    if (!n) return;
+
+    const match = CATEGORY_NAMES.find(x => {
+      const nx = normalizeName(x);
+      return n === nx || n.includes(nx) || nx.includes(n);
+    });
+
+    if (match && !found.some(x => x.name === match)) {
+      found.push({ name: match, url: href });
+    }
   });
 
-  // Fallback: keep any category links discovered even if the visible label changed.
-  if (found.length < 4) {
-    $("a[href*='/nl/c/']").each((_, a) => {
+  // The detailed category list on the homepage currently contains all 16 main categories.
+  // If labels change, keep the first unique category links as a fallback.
+  if (found.length < 10) {
+    $("a[href*='/c/']").each((_, a) => {
       const href = absoluteUrl($(a).attr("href"));
-      if (!href || found.some(x => x.url === href)) return;
+      if (!href || !/\/c\/\d+-/i.test(new URL(href).pathname)) return;
+      if (found.some(x => x.url === href)) return;
       const name = $(a).text().replace(/\s+/g, " ").trim();
       if (name) found.push({ name, url: href });
     });
@@ -104,37 +145,50 @@ function parseLots(html, categoryName) {
   const lots = [];
   const seen = new Set();
 
-  $("a[href*='/nl/l/']").each((_, a) => {
+  // Catawiki may return /nl/l/, /en/l/ or another locale. Do not hard-code /nl/l/.
+  $("a[href]").each((_, a) => {
     const href = absoluteUrl($(a).attr("href"));
-    if (!href || seen.has(href)) return;
+    if (!href || !looksLikeLotUrl(href) || seen.has(href)) return;
 
-    const card = $(a).closest("article, li, div").first();
-    const text = (card.text() || $(a).parent().text() || $(a).text())
-      .replace(/\s+/g, " ").trim();
+    const aText = $(a).text().replace(/\s+/g, " ").trim();
+    const card = $(a).closest("article, li").first();
+    const cardText = (card.text() || "").replace(/\s+/g, " ").trim();
+    const parentText = ($(a).parent().text() || "").replace(/\s+/g, " ").trim();
+    const text = [cardText, parentText, aText].filter(Boolean).sort((x, y) => y.length - x.length)[0] || aText;
 
-    // Keep reasonably lot-like links; avoid collecting navigation links.
     if (text.length < 8) return;
 
-    const bid = euroNumber(text.match(/(?:eindbod|huidig bod|bod|current bid)\s*€?\s*[\d.]+(?:,\d{1,2})?/i)?.[0] || text);
-    const title = ($(a).attr("aria-label") || $(a).text() || "").replace(/\s+/g, " ").trim() ||
-      text.slice(0, 140);
+    const currentBid = firstEuro(text, [
+      /(?:huidig bod|current bid|eindbod|bod)\s*[:]?\s*€?\s*[\d.]+(?:,\d{1,2})?/i,
+      /€\s*[\d.]+(?:,\d{1,2})?/i
+    ]);
 
-    // Try to capture a machine-readable closing datetime when present.
+    const catawikiEstimateLow = firstEuro(text, [
+      /(?:schatting detailhandel|geschatte waarde|retail estimate|estimated value)\s*[:]?\s*€?\s*[\d.]+(?:,\d{1,2})?/i
+    ]);
+
+    let title = ($(a).attr("aria-label") || aText || "").replace(/\s+/g, " ").trim();
+    if (!title || title.length < 4) title = text.slice(0, 180);
+
     let endAt = null;
-    const scope = card;
-    scope.find("time[datetime]").each((_, t) => { if (!endAt) endAt = $(t).attr("datetime"); });
+    card.find("time[datetime]").each((_, t) => {
+      if (!endAt) endAt = $(t).attr("datetime") || null;
+    });
     if (!endAt) {
-      const raw = scope.html() || "";
-      const m = raw.match(/(?:endDate|end_at|endsAt|closingDate)[^"']{0,80}["']([^"']+)["']/i);
+      const raw = card.html() || $(a).parent().html() || "";
+      const m = raw.match(/(?:endDate|end_at|endsAt|closingDate|auctionEnd)[^"']{0,120}["']([^"']+)["']/i);
       if (m) endAt = m[1];
     }
 
+    const bid = currentBid;
     lots.push({
-      id: href.split("/").pop(),
+      id: href.match(/\/l\/(\d+)/i)?.[1] || href.split("/").pop(),
       title,
       currentBid: bid,
       buyerProtectionFee: buyerProtection(bid),
       shipping: null,
+      catawikiEstimateLow,
+      catawikiEstimateHigh: null,
       expectedResale: null,
       maxBid: null,
       possibleProfit: null,
@@ -166,7 +220,7 @@ app.get("/api/categories", async (req, res) => {
     const cats = await discoverCategories();
     res.json({ categories: cats, count: cats.length });
   } catch (e) {
-    res.status(502).json({ error: e.message });
+    res.status(502).json({ ok: false, error: e.message });
   }
 });
 
@@ -179,7 +233,8 @@ app.get("/api/lots", async (req, res) => {
     if (!categories.length) throw new Error("Geen Catawiki-categoriepagina's gevonden.");
 
     const results = [];
-    // Keep requests modest to avoid hammering Catawiki.
+    const errors = [];
+
     for (const category of categories) {
       try {
         const data = await fetchCategoryToday(category);
@@ -187,21 +242,27 @@ app.get("/api/lots", async (req, res) => {
           if (!q || `${lot.title} ${lot.category}`.toLowerCase().includes(q)) results.push(lot);
         }
       } catch (err) {
+        errors.push({ category: category.name, error: err.message });
         console.error(`Categorie mislukt: ${category.name}: ${err.message}`);
       }
     }
+
+    // De same lot can appear in more than one category/navigation surface.
+    const unique = Array.from(new Map(results.map(lot => [lot.url, lot])).values());
 
     res.json({
       ok: true,
       ending,
       date: todayNL(),
-      count: results.length,
-      lots: results.slice(0, 250),
-      note: "Live publieke Catawiki-gegevens. Resale/max-bid worden pas ingevuld zodra een betrouwbare vergelijkingsbron wordt gekoppeld."
+      categoriesChecked: categories.length,
+      count: unique.length,
+      lots: unique.slice(0, 250),
+      errors: errors.slice(0, 16),
+      note: "Live publieke Catawiki-gegevens. Catawiki's eigen waardeschatting is apart gemarkeerd; resale/max-bid worden niet gefingeerd."
     });
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
   }
 });
 
-app.listen(PORT, () => console.log(`Catawiki backend listening on ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Catawiki backend listening on ${PORT}`));
